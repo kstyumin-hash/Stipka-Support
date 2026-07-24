@@ -26,10 +26,14 @@ dp = Dispatcher(storage=MemoryStorage())
 # Множество активных администраторов
 ADMINS = {SUPER_ADMIN_ID}
 
-# Структура данных тикетов
-# active_tickets: {user_id: ticket_id}
-# tickets: {ticket_id: {"user_id": int, "status": "open", "messages": [{"sender": str, "text": str}]}}
-active_tickets = {}
+# База данных тикетов в памяти
+# tickets = {
+#    ticket_id: {
+#        "user_id": int,
+#        "status": "open" | "closed",
+#        "messages": [{"sender": str, "text": str}]
+#    }
+# }
 tickets = {}
 ticket_counter = 1
 
@@ -38,6 +42,9 @@ class AdminStates(StatesGroup):
     waiting_for_reply = State()
     waiting_for_new_admin_id = State()
     waiting_for_remove_admin_id = State()
+
+class UserStates(StatesGroup):
+    waiting_for_ticket_msg = State()
 
 # --- ВЕБ-СЕРВЕР ДЛЯ UPTIMEROBOT ---
 async def handle_ping(request):
@@ -57,18 +64,32 @@ async def start_web_server():
 def is_admin(user_id: int) -> bool:
     return user_id in ADMINS
 
-# --- КЛАВИАТУРЫ ---
-def get_main_keyboard():
+# --- КЛАВИАТУРЫ ПОЛЬЗОВАТЕЛЯ ---
+def get_user_main_kb():
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Оплатили? Напишите и отправьте чек!", callback_data="create_ticket")]
+            [InlineKeyboardButton(text="➕ Создать новый тикет", callback_data="user_create_ticket")],
+            [InlineKeyboardButton(text="🗂 Мои тикеты", callback_data="user_my_tickets")]
         ]
     )
 
+def get_user_tickets_kb(user_id: int):
+    user_tickets = [t_id for t_id, data in tickets.items() if data["user_id"] == user_id]
+    buttons = []
+
+    for t_id in user_tickets:
+        status_symbol = "🟢" if tickets[t_id]["status"] == "open" else "🔴"
+        buttons.append([InlineKeyboardButton(text=f"{status_symbol} Тикет #{t_id}", callback_data=f"user_view_ticket_{t_id}")])
+
+    buttons.append([InlineKeyboardButton(text="« Назад", callback_data="user_main_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+# --- КЛАВИАТУРЫ АДМИНА ---
 def get_admin_main_kb():
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="📩 Сообщения (Тикеты)", callback_data="admin_tickets")],
+            [InlineKeyboardButton(text="📩 Активные тикеты", callback_data="admin_tickets_open")],
+            [InlineKeyboardButton(text="📁 Архив (Закрытые)", callback_data="admin_tickets_closed")],
             [InlineKeyboardButton(text="👥 Управление админами", callback_data="admin_manage_admins")]
         ]
     )
@@ -82,80 +103,148 @@ def get_admins_manage_kb():
         ]
     )
 
-def get_ticket_manage_kb(ticket_id: int):
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📜 Посмотреть сообщения", callback_data=f"history_ticket_{ticket_id}")],
-            [
-                InlineKeyboardButton(text="Ответить", callback_data=f"reply_ticket_{ticket_id}"),
-                InlineKeyboardButton(text="Закрыть", callback_data=f"close_ticket_{ticket_id}")
-            ],
-            [InlineKeyboardButton(text="« Назад к тикетам", callback_data="admin_tickets")]
-        ]
-    )
+def get_admin_ticket_manage_kb(ticket_id: int):
+    is_open = tickets.get(ticket_id, {}).get("status") == "open"
+    buttons = [
+        [InlineKeyboardButton(text="📜 Посмотреть историю", callback_data=f"history_ticket_{ticket_id}")]
+    ]
+    if is_open:
+        buttons.append([
+            InlineKeyboardButton(text="Ответить", callback_data=f"reply_ticket_{ticket_id}"),
+            InlineKeyboardButton(text="Закрыть", callback_data=f"close_ticket_{ticket_id}")
+        ])
+    buttons.append([InlineKeyboardButton(text="« Назад к тикетам", callback_data="admin_tickets_open")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
 
 # --- ПОЛЬЗОВАТЕЛЬСКАЯ ЧАСТЬ ---
 @dp.message(Command("start"))
-async def cmd_start(message: types.Message):
+async def cmd_start(message: types.Message, state: FSMContext):
+    await state.clear()
     await message.answer(
         "👋 **Добро пожаловать в поддержку Stopka Payments!**\n\n"
-        "Оплатили? Напишите и прикрепите чек ниже, создав обращение.",
+        "Создайте обращение или проверьте свои существующие тикеты ниже.",
         parse_mode="Markdown",
-        reply_markup=get_main_keyboard()
+        reply_markup=get_user_main_kb()
     )
 
-@dp.callback_query(F.data == "create_ticket")
-async def process_create_ticket(callback: types.CallbackQuery):
+@dp.callback_query(F.data == "user_main_menu")
+async def user_main_menu_cb(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text(
+        "👋 **Главное меню поддержки Stopka Payments**",
+        reply_markup=get_user_main_kb()
+    )
+
+@dp.callback_query(F.data == "user_create_ticket")
+async def process_create_ticket(callback: types.CallbackQuery, state: FSMContext):
     global ticket_counter
     user_id = callback.from_user.id
 
-    if user_id in active_tickets:
-        ticket_id = active_tickets[user_id]
-        await callback.message.answer(
-            f"У вас уже есть активный **Тикет #{ticket_id}**.\n"
-            "Вы можете отправлять сюда сообщения и скриншоты — поддержка их получит."
-        )
-    else:
-        ticket_id = ticket_counter
-        ticket_counter += 1
-        active_tickets[user_id] = ticket_id
-        tickets[ticket_id] = {
-            "user_id": user_id,
-            "status": "open",
-            "messages": []
-        }
+    ticket_id = ticket_counter
+    ticket_counter += 1
 
-        await callback.message.answer(
-            f"✅ **Тикет #{ticket_id} успешно создан!**\n\n"
-            "Отправьте скриншот и детали обращения прямо в этот чат. "
-            "Вы можете отправлять сообщения столько раз, сколько нужно, пока админ не закроет тикет."
-        )
+    tickets[ticket_id] = {
+        "user_id": user_id,
+        "status": "open",
+        "messages": []
+    }
+
+    await state.update_data(active_ticket_id=ticket_id)
+    await state.set_state(UserStates.waiting_for_ticket_msg)
+
+    await callback.message.answer(
+        f"✅ **Тикет #{ticket_id} создан!**\n\n"
+        "Отправьте текстовое сообщение или чек/скриншот прямо в этот чат:"
+    )
     await callback.answer()
 
-# Прием сообщений от пользователей в рамках тикета
-@dp.message(lambda msg: not is_admin(msg.from_user.id))
-async def handle_user_messages(message: types.Message):
-    user_id = message.from_user.id
+@dp.callback_query(F.data == "user_my_tickets")
+async def process_my_tickets(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    user_tickets = [t_id for t_id, data in tickets.items() if data["user_id"] == user_id]
 
-    if user_id not in active_tickets:
-        await message.answer(
-            "У вас нет активного обращения. Нажмите /start и создайте тикет.",
-            reply_markup=get_main_keyboard()
+    if not user_tickets:
+        await callback.message.edit_text(
+            "У вас пока нет созданных тикетов.",
+            reply_markup=get_user_main_kb()
         )
         return
 
-    ticket_id = active_tickets[user_id]
-    ticket = tickets[ticket_id]
+    await callback.message.edit_text(
+        "🗂 **Ваши тикеты:**\n\n🟢 — Открыт (можно писать)\n🔴 — Закрыт",
+        parse_mode="Markdown",
+        reply_markup=get_user_tickets_kb(user_id)
+    )
 
-    text_content = message.text or message.caption or "[Фото/Чек]"
+@dp.callback_query(F.data.startswith("user_view_ticket_"))
+async def user_view_ticket(callback: types.CallbackQuery, state: FSMContext):
+    ticket_id = int(callback.data.split("_")[3])
+    ticket = tickets.get(ticket_id)
+
+    if not ticket:
+        await callback.answer("Тикет не найден.")
+        return
+
+    status_str = "🟢 Открыт" if ticket["status"] == "open" else "🔴 Закрыт"
+    
+    msg_history = f"🎫 **Тикет #{ticket_id}** (Статус: {status_str})\n\n"
+    msg_history += "📜 **История переписки:**\n"
+    
+    if not ticket["messages"]:
+        msg_history += "_Сообщений пока нет._\n"
+    else:
+        for item in ticket["messages"]:
+            msg_history += f"• **{item['sender']}**: {item['text']}\n"
+
+    kb_buttons = []
+    if ticket["status"] == "open":
+        kb_buttons.append([InlineKeyboardButton(text="✍️ Написать в этот тикет", callback_data=f"user_reply_ticket_{ticket_id}")])
+    kb_buttons.append([InlineKeyboardButton(text="« К списку тикетов", callback_data="user_my_tickets")])
+
+    await callback.message.edit_text(
+        msg_history,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_buttons)
+    )
+
+@dp.callback_query(F.data.startswith("user_reply_ticket_"))
+async def user_reply_ticket_start(callback: types.CallbackQuery, state: FSMContext):
+    ticket_id = int(callback.data.split("_")[3])
+    ticket = tickets.get(ticket_id)
+
+    if not ticket or ticket["status"] != "open":
+        await callback.answer("Тикет закрыт или не существует.")
+        return
+
+    await state.update_data(active_ticket_id=ticket_id)
+    await state.set_state(UserStates.waiting_for_ticket_msg)
+    await callback.message.answer(f"✍️ Напишите новое сообщение для **Тикета #{ticket_id}**:")
+    await callback.answer()
+
+# Приём сообщений от пользователя для конкретного тикета
+@dp.message(UserStates.waiting_for_ticket_msg, lambda msg: not is_admin(msg.from_user.id))
+async def handle_user_ticket_message(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    ticket_id = data.get("active_ticket_id")
+    ticket = tickets.get(ticket_id)
+
+    if not ticket or ticket["status"] != "open":
+        await message.answer("Ошибка: выберите открытый тикет из меню /start", reply_markup=get_user_main_kb())
+        await state.clear()
+        return
+
+    text_content = message.text or message.caption or "[Фото/Скриншот]"
+    
+    # Сохраняем сообщение в историю
     ticket["messages"].append({
-        "sender": f"Пользователь (ID: {user_id})",
+        "sender": "Вы",
         "text": text_content
     })
 
-    user_info = f"@{message.from_user.username}" if message.from_user.username else f"ID: {user_id}"
+    user_info = f"@{message.from_user.username}" if message.from_user.username else f"ID: {message.from_user.id}"
 
-    # Рассылка всем администраторам
+    # Пересылаем всем админам
     for admin_id in ADMINS:
         try:
             await bot.send_message(
@@ -163,11 +252,24 @@ async def handle_user_messages(message: types.Message):
                 f"📩 **Новое сообщение в Тикете #{ticket_id}** от {user_info}:",
                 parse_mode="Markdown"
             )
-            await message.copy_to(chat_id=admin_id, reply_markup=get_ticket_manage_kb(ticket_id))
+            await message.copy_to(chat_id=admin_id, reply_markup=get_admin_ticket_manage_kb(ticket_id))
         except Exception as e:
-            logging.error(f"Не удалось отправить уведомление админу {admin_id}: {e}")
+            logging.error(f"Ошибка отправки админу {admin_id}: {e}")
 
-    await message.answer("Сообщение доставлено поддержке Stopka Payments! Ожидайте ответа.")
+    await message.answer(
+        f"✅ Сообщение добавлено в **Тикет #{ticket_id}** и переслано поддержке!",
+        reply_markup=get_user_main_kb()
+    )
+    await state.clear()
+
+# Если пользователь пишет просто так вне FSM режима
+@dp.message(lambda msg: not is_admin(msg.from_user.id))
+async def handle_fallback_user_message(message: types.Message):
+    await message.answer(
+        "Нажмите /start и выберите или создайте тикет, чтобы отправить сообщение.",
+        reply_markup=get_user_main_kb()
+    )
+
 
 # --- АДМИН-ПАНЕЛЬ ---
 @dp.message(Command("admin"))
@@ -194,11 +296,10 @@ async def admin_main_menu_cb(callback: types.CallbackQuery, state: FSMContext):
         reply_markup=get_admin_main_kb()
     )
 
-# Управление админами
+# Управление списком администраторов
 @dp.callback_query(F.data == "admin_manage_admins")
 async def admin_manage_admins(callback: types.CallbackQuery):
     if not is_admin(callback.from_user.id):
-        await callback.answer("Доступ запрещен.", show_alert=True)
         return
 
     admins_list_text = "\n".join([f"• `{a_id}`" for a_id in ADMINS])
@@ -212,7 +313,6 @@ async def admin_manage_admins(callback: types.CallbackQuery):
 @dp.callback_query(F.data == "admin_add_new")
 async def admin_add_new_start(callback: types.CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
-        await callback.answer("Доступ запрещен.", show_alert=True)
         return
 
     await state.set_state(AdminStates.waiting_for_new_admin_id)
@@ -236,7 +336,6 @@ async def process_add_new_admin(message: types.Message, state: FSMContext):
 @dp.callback_query(F.data == "admin_remove_exist")
 async def admin_remove_start(callback: types.CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
-        await callback.answer("Доступ запрещен.", show_alert=True)
         return
 
     await state.set_state(AdminStates.waiting_for_remove_admin_id)
@@ -249,7 +348,7 @@ async def process_remove_admin(message: types.Message, state: FSMContext):
         return
 
     if not message.text.isdigit():
-        await message.answer("❌ Telegram ID должен состоять только из цифр. Попробуйте еще раз:")
+        await message.answer("❌ Telegram ID должен состоять только из цифр:")
         return
 
     remove_id = int(message.text)
@@ -266,61 +365,39 @@ async def process_remove_admin(message: types.Message, state: FSMContext):
 
     await state.clear()
 
-# Список тикетов
-@dp.callback_query(F.data == "admin_tickets")
+# Списки тикетов (Открытые / Архив)
+@dp.callback_query(F.data.in_({"admin_tickets_open", "admin_tickets_closed"}))
 async def admin_list_tickets(callback: types.CallbackQuery):
     if not is_admin(callback.from_user.id):
-        await callback.answer("Доступ запрещен.", show_alert=True)
         return
 
-    open_tickets = {t_id: data for t_id, data in tickets.items() if data["status"] == "open"}
+    status_filter = "open" if callback.data == "admin_tickets_open" else "closed"
+    filtered_tickets = {t_id: data for t_id, data in tickets.items() if data["status"] == status_filter}
 
-    if not open_tickets:
+    title = "📩 **Активные тикеты:**" if status_filter == "open" else "📁 **Архив тикетов:**"
+
+    if not filtered_tickets:
         await callback.message.edit_text(
-            "⚙️ **Админ панель**\n\nАктивных тикетов нет.",
+            f"{title}\n\nСписок пуст.",
+            parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="Обновить", callback_data="admin_tickets")],
                 [InlineKeyboardButton(text="« Назад в меню", callback_data="admin_main_menu")]
             ])
         )
         return
 
     buttons = []
-    for t_id in open_tickets:
-        buttons.append([InlineKeyboardButton(text=f"Тикет #{t_id}", callback_data=f"view_ticket_{t_id}")])
+    for t_id in filtered_tickets:
+        buttons.append([InlineKeyboardButton(text=f"Тикет #{t_id} (Сообщений: {len(tickets[t_id]['messages'])})", callback_data=f"view_ticket_{t_id}")])
 
     buttons.append([InlineKeyboardButton(text="« Назад в меню", callback_data="admin_main_menu")])
 
     kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-    await callback.message.edit_text("⚙️ **Админ панель — Сообщения:**", reply_markup=kb)
+    await callback.message.edit_text(title, parse_mode="Markdown", reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("view_ticket_"))
 async def admin_view_ticket(callback: types.CallbackQuery):
     if not is_admin(callback.from_user.id):
-        await callback.answer("Доступ запрещен.", show_alert=True)
-        return
-
-    ticket_id = int(callback.data.split("_")[2])
-    ticket = tickets.get(ticket_id)
-
-    if not ticket or ticket["status"] != "open":
-        await callback.answer("Тикет не найден или уже закрыт.")
-        return
-
-    await callback.message.edit_text(
-        f"🎫 **Тикет #{ticket_id}**\n"
-        f"Пользователь: `{ticket['user_id']}`\n"
-        f"Сообщений в истории: {len(ticket['messages'])}\n\n"
-        "Выберите действие:",
-        parse_mode="Markdown",
-        reply_markup=get_ticket_manage_kb(ticket_id)
-    )
-
-# Просмотр истории сообщений в тикете
-@dp.callback_query(F.data.startswith("history_ticket_"))
-async def admin_view_ticket_history(callback: types.CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer("Доступ запрещен.", show_alert=True)
         return
 
     ticket_id = int(callback.data.split("_")[2])
@@ -330,9 +407,34 @@ async def admin_view_ticket_history(callback: types.CallbackQuery):
         await callback.answer("Тикет не найден.")
         return
 
-    msg_history = f"📜 **История сообщений — Тикет #{ticket_id}:**\n\n"
+    status_txt = "🟢 Открыт" if ticket['status'] == 'open' else "🔴 Закрыт"
+
+    await callback.message.edit_text(
+        f"🎫 **Тикет #{ticket_id}**\n"
+        f"Статус: {status_txt}\n"
+        f"Пользователь ID: `{ticket['user_id']}`\n"
+        f"Сообщений в истории: {len(ticket['messages'])}\n\n"
+        "Выберите действие:",
+        parse_mode="Markdown",
+        reply_markup=get_admin_ticket_manage_kb(ticket_id)
+    )
+
+# Просмотр истории
+@dp.callback_query(F.data.startswith("history_ticket_"))
+async def admin_view_ticket_history(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+
+    ticket_id = int(callback.data.split("_")[2])
+    ticket = tickets.get(ticket_id)
+
+    if not ticket:
+        await callback.answer("Тикет не найден.")
+        return
+
+    msg_history = f"📜 **История переписки — Тикет #{ticket_id}:**\n\n"
     if not ticket["messages"]:
-        msg_history += "_История пока пуста._"
+        msg_history += "_История пуста._"
     else:
         for item in ticket["messages"]:
             msg_history += f"👤 **{item['sender']}**:\n{item['text']}\n───────────────\n"
@@ -343,7 +445,6 @@ async def admin_view_ticket_history(callback: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("reply_ticket_"))
 async def start_reply_ticket(callback: types.CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
-        await callback.answer("Доступ запрещен.", show_alert=True)
         return
 
     ticket_id = int(callback.data.split("_")[2])
@@ -351,7 +452,7 @@ async def start_reply_ticket(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(AdminStates.waiting_for_reply)
 
     await callback.message.answer(
-        f"✍️ Напишите ответ для **Тикета #{ticket_id}** (можно отправлять текст или файлы):"
+        f"✍️ Напишите ответ для **Тикета #{ticket_id}** (можно отправлять текст или фото):"
     )
     await callback.answer()
 
@@ -368,12 +469,10 @@ async def send_reply_to_user(message: types.Message, state: FSMContext):
         user_id = ticket["user_id"]
         try:
             await message.send_copy(chat_id=user_id)
-            
-            # Сохраняем ответ админа в историю тикета
-            admin_info = f"Админ (ID: {message.from_user.id})"
-            text_content = message.text or message.caption or "[Файл/Фото]"
+
+            text_content = message.text or message.caption or "[Фото/Файл]"
             ticket["messages"].append({
-                "sender": admin_info,
+                "sender": f"Поддержка (Админ {message.from_user.id})",
                 "text": text_content
             })
 
@@ -381,14 +480,13 @@ async def send_reply_to_user(message: types.Message, state: FSMContext):
         except Exception as e:
             await message.answer(f"❌ Не удалось отправить сообщение пользователю: {e}")
     else:
-        await message.answer("Ошибка: тикет больше не активен.")
+        await message.answer("Ошибка: тикет закрыт или не найден.")
 
     await state.clear()
 
 @dp.callback_query(F.data.startswith("close_ticket_"))
 async def close_ticket(callback: types.CallbackQuery):
     if not is_admin(callback.from_user.id):
-        await callback.answer("Доступ запрещен.", show_alert=True)
         return
 
     ticket_id = int(callback.data.split("_")[2])
@@ -397,19 +495,16 @@ async def close_ticket(callback: types.CallbackQuery):
     if ticket and ticket["status"] == "open":
         user_id = ticket["user_id"]
         ticket["status"] = "closed"
-        if user_id in active_tickets:
-            del active_tickets[user_id]
 
         try:
             await bot.send_message(
                 user_id,
-                f"🔒 Ваш **Тикет #{ticket_id}** был закрыт администратором. "
-                "Если у вас появятся новые вопросы, вы можете создать новый тикет с помощью /start."
+                f"🔒 Ваш **Тикет #{ticket_id}** был закрыт администратором."
             )
         except Exception:
             pass
 
-        await callback.message.edit_text(f"🔴 **Тикет #{ticket_id} закрыт.**")
+        await callback.message.edit_text(f"🔴 **Тикет #{ticket_id} перенесен в архив.**")
     else:
         await callback.answer("Тикет уже закрыт.")
 
