@@ -131,7 +131,8 @@ async def cmd_start(message: types.Message, state: FSMContext):
     if is_admin(message.from_user.id):
         await message.answer(
             "⚙️ **Добро пожаловать в панель поддержки Stopka Payments!**\n\n"
-            "Используйте /admin, чтобы открыть панель администратора.",
+            "Используйте /admin, чтобы открыть панель администратора.\n"
+            "А если хотите написать сообщение в поддержку сами (как клиент) — просто напишите его сюда в чат.",
             parse_mode="Markdown"
         )
         return
@@ -482,10 +483,10 @@ async def close_ticket(callback: types.CallbackQuery):
 async def handle_user_message(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
 
-    # Админы работают только через панель /admin, а не обычными сообщениями
-    if is_admin(user_id):
-        return
-
+    # Админ/владелец тоже может писать в поддержку как обычный клиент —
+    # его сообщения (когда он НЕ в состоянии ответа на чужой тикет —
+    # это отсекается более ранними хендлерами FSM) создают/пополняют
+    # его собственный тикет точно так же, как у обычного пользователя.
     global ticket_counter
     open_tickets = [t_id for t_id, data in tickets.items() if data["user_id"] == user_id and data["status"] == "open"]
 
@@ -528,7 +529,10 @@ async def handle_user_message(message: types.Message, state: FSMContext):
 
     # Уведомление о тикете видят только администраторы — пользователю ничего не сообщаем,
     # чтобы для него это выглядело как обычный чат с человеком.
+    # Если пишет сам админ/владелец — не дублируем уведомление ему самому.
     for admin_id in ADMINS:
+        if admin_id == user_id:
+            continue
         try:
             await bot.send_message(admin_id, header, parse_mode="Markdown")
             await message.copy_to(chat_id=admin_id, reply_markup=get_admin_ticket_manage_kb(ticket_id))
